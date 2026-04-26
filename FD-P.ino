@@ -1,5 +1,5 @@
 /**
- * Line Following Robot — ESP32 + L298N
+ * Line Following Robot — ESP32 + L298N + 5 IR Sensors
  * ─────────────────────────────────────────────────────────────
  * Features:
  *   • Sensor calibration (manual sweep at boot)
@@ -42,9 +42,11 @@
 // Set -1 if not used (bridge is always enabled by a jumper).
 static constexpr int STBY = 17;
 
-#define LEFT_SENSOR   25
-#define CENTER_SENSOR 26
-#define RIGHT_SENSOR  27
+#define FAR_LEFT_SENSOR  32
+#define LEFT_SENSOR      25
+#define CENTER_SENSOR    26
+#define RIGHT_SENSOR     27
+#define FAR_RIGHT_SENSOR 33
 
 // ═══════════════════════════════════════════════════════════════
 //  ESP32 LEDC (replaces analogWrite)
@@ -102,9 +104,13 @@ static float kalmX = 0.0f;  // state estimate
 static float kalmP = 1.0f;  // estimate covariance
 
 // Sensor calibration
-static int minL = 4095, maxL = 0;
-static int minC = 4095, maxC = 0;
-static int minR = 4095, maxR = 0;
+static constexpr int NUM_SENSORS = 5;
+static const int sensorPins[NUM_SENSORS]    = { FAR_LEFT_SENSOR, LEFT_SENSOR, CENTER_SENSOR, RIGHT_SENSOR, FAR_RIGHT_SENSOR };
+static const int sensorWeights[NUM_SENSORS] = { -2, -1, 0, 1, 2 };
+static const char * const sensorNames[NUM_SENSORS] = { "FL", "L", "C", "R", "FR" };
+
+static int minSensor[NUM_SENSORS] = { 4095, 4095, 4095, 4095, 4095 };
+static int maxSensor[NUM_SENSORS] = { 0, 0, 0, 0, 0 };
 
 // RL
 // States 0–4 are positional (on-line); state 5 is the explicit LOST state.
@@ -131,8 +137,9 @@ static RLTransition rlPrev;
 //  before the helpers it calls)
 // ═══════════════════════════════════════════════════════════════
 static int   safeMap(int x, int in_min, int in_max, int out_min, int out_max);
-void         readSensors(int &L, int &C, int &R);
-float        getError(int L, int C, int R);
+void         readSensors(int sensors[NUM_SENSORS]);
+static bool  isLineDetected(const int sensors[NUM_SENSORS]);
+float        getError(const int sensors[NUM_SENSORS]);
 float        kalmanFilter(float measurement);
 void         setMotor(int A, int B);
 static void  stopMotors();
@@ -197,16 +204,16 @@ static bool autoTunePID() {
     driverEnable(true);  // enable once, outside the loop
 
     while (millis() - start < TUNE_TIMEOUT_MS) {
-        int L, C, R;
-        readSensors(L, C, R);
+        int sensors[NUM_SENSORS];
+        readSensors(sensors);
 
-        if (L < DETECT_THRESH && C < DETECT_THRESH && R < DETECT_THRESH) {
+        if (!isLineDetected(sensors)) {
             stopMotors();
             Serial.println("AUTO-TUNE: line lost, aborting.");
             return false;
         }
 
-        float err = kalmanFilter(getError(L, C, R));
+        float err = kalmanFilter(getError(sensors));
 
         // Relay: bang-bang around target with deadband.
         if      (err >  (TUNE_TARGET_ERROR + TUNE_DEADBAND)) driveRight = false;
@@ -316,18 +323,30 @@ static int safeMap(int x, int in_min, int in_max, int out_min, int out_max) {
     return (int)constrain(v, (long)out_min, (long)out_max);
 }
 
-void readSensors(int &L, int &C, int &R) {
-    L = safeMap(analogRead(LEFT_SENSOR),   minL, maxL, 0, 1000);
-    C = safeMap(analogRead(CENTER_SENSOR), minC, maxC, 0, 1000);
-    R = safeMap(analogRead(RIGHT_SENSOR),  minR, maxR, 0, 1000);
+void readSensors(int sensors[NUM_SENSORS]) {
+    for (int i = 0; i < NUM_SENSORS; ++i) {
+        sensors[i] = safeMap(analogRead(sensorPins[i]), minSensor[i], maxSensor[i], 0, 1000);
+    }
+}
+
+static bool isLineDetected(const int sensors[NUM_SENSORS]) {
+    for (int i = 0; i < NUM_SENSORS; ++i) {
+        if (sensors[i] > DETECT_THRESH) return true;
+    }
+    return false;
 }
 
 // Weighted centroid: –1 = far left, 0 = centre, +1 = far right
-float getError(int L, int C, int R) {
-    const long sum = (long)L + (long)C + (long)R;
+float getError(const int sensors[NUM_SENSORS]) {
+    long sum      = 0;
+    long weighted = 0;
+    for (int i = 0; i < NUM_SENSORS; ++i) {
+        sum      += (long)sensors[i];
+        weighted += (long)sensorWeights[i] * (long)sensors[i];
+    }
     if (sum < 50) return pidPrevError; // line lost → hold last error
 
-    const float e = (-1.0f * L + 0.0f * C + 1.0f * R) / (float)sum;
+    const float e = (float)weighted / (2.0f * (float)sum);
     return constrain(e, -1.0f, 1.0f);
 }
 
@@ -429,8 +448,8 @@ void setup() {
         pinMode(pin, OUTPUT);
     if (STBY >= 0) pinMode(STBY, OUTPUT);
 
-    for (int pin : {LEFT_SENSOR, CENTER_SENSOR, RIGHT_SENSOR})
-        pinMode(pin, INPUT);
+    for (int i = 0; i < NUM_SENSORS; ++i)
+        pinMode(sensorPins[i], INPUT);
 
     // ── LEDC PWM ──────────────────────────────────────────────
     ledcSetup(PWM_CH_A, PWM_FREQ_HZ, PWM_RES_BITS);
@@ -450,13 +469,11 @@ void setup() {
     Serial.println("=== CALIBRATION — move robot over line+background now ===");
 
     for (int i = 0; i < 2000; ++i) {
-        const int l = analogRead(LEFT_SENSOR);
-        const int c = analogRead(CENTER_SENSOR);
-        const int r = analogRead(RIGHT_SENSOR);
-
-        minL = min(minL, l);  maxL = max(maxL, l);
-        minC = min(minC, c);  maxC = max(maxC, c);
-        minR = min(minR, r);  maxR = max(maxR, r);
+        for (int sensorIdx = 0; sensorIdx < NUM_SENSORS; ++sensorIdx) {
+            const int value = analogRead(sensorPins[sensorIdx]);
+            minSensor[sensorIdx] = min(minSensor[sensorIdx], value);
+            maxSensor[sensorIdx] = max(maxSensor[sensorIdx], value);
+        }
 
         delay(2);
     }
@@ -468,12 +485,15 @@ void setup() {
             hi = min(cap, hi + margin);
         }
     };
-    widen(minL, maxL, 25, 4095);
-    widen(minC, maxC, 25, 4095);
-    widen(minR, maxR, 25, 4095);
+    for (int i = 0; i < NUM_SENSORS; ++i) {
+        widen(minSensor[i], maxSensor[i], 25, 4095);
+    }
 
-    Serial.printf("CAL  L[%d..%d]  C[%d..%d]  R[%d..%d]\n",
-                  minL, maxL, minC, maxC, minR, maxR);
+    Serial.print("CAL");
+    for (int i = 0; i < NUM_SENSORS; ++i) {
+        Serial.printf("  %s[%d..%d]", sensorNames[i], minSensor[i], maxSensor[i]);
+    }
+    Serial.println();
 
     // ── AUTO-TUNE ─────────────────────────────────────────────
     if (AUTO_TUNE_PID) {
@@ -494,16 +514,16 @@ void setup() {
 // ═══════════════════════════════════════════════════════════════
 void loop() {
     // ── 1. Sense ──────────────────────────────────────────────
-    int L, C, R;
-    readSensors(L, C, R);
-    const bool detected = (L > DETECT_THRESH || C > DETECT_THRESH || R > DETECT_THRESH);
+    int sensors[NUM_SENSORS];
+    readSensors(sensors);
+    const bool detected = isLineDetected(sensors);
 
     if (!detected) {
         // Soft integral decay avoids a burst when the line reappears.
         pidIntegral *= 0.90f;
     }
 
-    const float rawError = getError(L, C, R);
+    const float rawError = getError(sensors);
     const float error    = kalmanFilter(rawError);
 
     // ── 2. PID ────────────────────────────────────────────────

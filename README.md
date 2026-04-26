@@ -1,10 +1,11 @@
 ## FD-P (ESP32 Arduino Core)
 
-This folder contains an ESP32 Arduino sketch for a 3-sensor line-following robot using:
+This folder contains an ESP32 Arduino sketch for a 5-sensor line-following robot using:
 - Sensor normalization + calibration
 - Kalman filtering
 - PID control
 - A small RL (Q-learning) correction layer
+- A 5-channel weighted error calculation (`FL/L/C/R/FR`)
 
 ### Files
 - `FD-P.ino` — ESP32 Arduino sketch (recommended)
